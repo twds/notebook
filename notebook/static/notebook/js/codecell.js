@@ -467,7 +467,7 @@ define([
         } else {
             ns = encodeURIComponent(prompt_value);
         }
-        return '<bdi>In</bdi>&nbsp;[' + ns + ']:';
+        return '<bdi>In</bdi>&nbsp;[' + ns + ']:<br/><a href="#" onclick="setTimeout(function(){ Jupyter.notebook.get_selected_cell().execute();},100); return false;">Run\&gt</a>';
     };
 
     CodeCell.input_prompt_continuation = function (prompt_value, lines_number) {
