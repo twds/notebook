@@ -26,6 +26,7 @@
           urlArgs: "v={{version_hash}}",
           {% endif %}
           baseUrl: '{{static_url("", include_version=False)}}',
+          timeout: 0,
           paths: {
             'auth/js/main': 'auth/js/main.min',
             custom : '{{ base_url }}custom',
