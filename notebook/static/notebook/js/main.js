@@ -81,11 +81,6 @@ require([
         console.log("Error processing custom.js. Logging and continuing");
         console.warn(err);
     }
-    try{
-        requirejs(['custom/js/custom'], function() {}); // load global custom/js
-    } catch(err) {
-        console.warn(err);
-    }
 
     // compat with old IPython, remove for IPython > 3.0
     window.CodeMirror = CodeMirror;
