@@ -10,6 +10,8 @@ import os
 import re
 import sys
 import traceback
+import types
+import warnings
 try:
     # py3
     from http.client import responses
@@ -102,6 +104,9 @@ class AuthenticatedHandler(web.RequestHandler):
         For example: in the default LoginHandler, if a request is token-authenticated,
         origin checking should be skipped.
         """
+        if self.request.method == 'OPTIONS':
+            # no origin-check on options requests, which are used to check origins!
+            return True
         if self.login_handler is None or not hasattr(self.login_handler, 'should_check_origin'):
             return False
         return not self.login_handler.should_check_origin(self)
@@ -279,6 +284,20 @@ class IPythonHandler(AuthenticatedHandler):
         if self.allow_credentials:
             self.set_header("Access-Control-Allow-Credentials", 'true')
     
+    def set_attachment_header(self, filename):
+        """Set Content-Disposition: attachment header
+
+        As a method to ensure handling of filename encoding
+        """
+        escaped_filename = url_escape(filename)
+        self.set_header('Content-Disposition',
+            'attachment;'
+            " filename*=utf-8''{utf8}"
+            .format(
+                utf8=escaped_filename,
+            )
+        )
+
     def get_origin(self):
         # Handle WebSocket Origin naming convention differences
         # The difference between version 8 and 13 is that in 8 the
@@ -436,6 +455,40 @@ class APIHandler(IPythonHandler):
             raise web.HTTPError(404)
         return super(APIHandler, self).prepare()
 
+    def write_error(self, status_code, **kwargs):
+        """APIHandler errors are JSON, not human pages"""
+        self.set_header('Content-Type', 'application/json')
+        message = responses.get(status_code, 'Unknown HTTP Error')
+        reply = {
+            'message': message,
+        }
+        exc_info = kwargs.get('exc_info')
+        if exc_info:
+            e = exc_info[1]
+            if isinstance(e, HTTPError):
+                reply['message'] = e.log_message or message
+            else:
+                reply['message'] = 'Unhandled error'
+                reply['traceback'] = ''.join(traceback.format_exception(*exc_info))
+        self.log.warning(reply['message'])
+        self.finish(json.dumps(reply))
+
+    def get_current_user(self):
+        """Raise 403 on API handlers instead of redirecting to human login page"""
+        # preserve _user_cache so we don't raise more than once
+        if hasattr(self, '_user_cache'):
+            return self._user_cache
+        self._user_cache = user = super(APIHandler, self).get_current_user()
+        return user
+
+    def get_login_url(self):
+        # if get_login_url is invoked in an API handler,
+        # that means @web.authenticated is trying to trigger a redirect.
+        # instead of redirecting, raise 403 instead.
+        if not self.current_user:
+            raise web.HTTPError(403)
+        return super(APIHandler, self).get_login_url()
+
     @property
     def content_security_policy(self):
         csp = '; '.join([
@@ -450,7 +503,7 @@ class APIHandler(IPythonHandler):
     def update_api_activity(self):
         """Update last_activity of API requests"""
         # record activity of authenticated requests
-        if self._track_activity and self.get_current_user():
+        if self._track_activity and getattr(self, '_user_cache', None):
             self.settings['api_last_activity'] = utcnow()
 
     def finish(self, *args, **kwargs):
@@ -459,10 +512,10 @@ class APIHandler(IPythonHandler):
         return super(APIHandler, self).finish(*args, **kwargs)
 
     def options(self, *args, **kwargs):
-        self.set_header('Access-Control-Allow-Headers', 'accept, content-type, authorization')
+        self.set_header('Access-Control-Allow-Headers',
+                        'accept, content-type, authorization, x-xsrftoken')
         self.set_header('Access-Control-Allow-Methods',
                         'GET, PUT, POST, PATCH, DELETE, OPTIONS')
-        self.finish()
 
 
 class Template404(IPythonHandler):
@@ -478,7 +531,7 @@ class AuthenticatedFileHandler(IPythonHandler, web.StaticFileHandler):
     def get(self, path):
         if os.path.splitext(path)[1] == '.ipynb' or self.get_argument("download", False):
             name = path.rsplit('/', 1)[-1]
-            self.set_header('Content-Disposition','attachment; filename="%s"' % escape.url_escape(name))
+            self.set_attachment_header(name)
 
         return web.StaticFileHandler.get(self, path)
     
@@ -533,32 +586,14 @@ def json_errors(method):
     2. Create and return a JSON body with a message field describing
        the error in a human readable form.
     """
+    warnings.warn('@json_errors is deprecated in notebook 5.2.0. Subclass APIHandler instead.',
+        DeprecationWarning,
+        stacklevel=2,
+    )
     @functools.wraps(method)
-    @gen.coroutine
     def wrapper(self, *args, **kwargs):
-        try:
-            result = yield gen.maybe_future(method(self, *args, **kwargs))
-        except web.HTTPError as e:
-            self.set_header('Content-Type', 'application/json')
-            status = e.status_code
-            message = e.log_message
-            self.log.warning(message)
-            self.set_status(e.status_code)
-            reply = dict(message=message, reason=e.reason)
-            self.finish(json.dumps(reply))
-        except Exception:
-            self.set_header('Content-Type', 'application/json')
-            self.log.error("Unhandled error in API request", exc_info=True)
-            status = 500
-            message = "Unknown server error"
-            t, value, tb = sys.exc_info()
-            self.set_status(status)
-            tb_text = ''.join(traceback.format_exception(t, value, tb))
-            reply = dict(message=message, reason=None, traceback=tb_text)
-            self.finish(json.dumps(reply))
-        else:
-            # FIXME: can use regular return in generators in py3
-            raise gen.Return(result)
+        self.write_error = types.MethodType(APIHandler.write_error, self)
+        return method(self, *args, **kwargs)
     return wrapper
 
 
@@ -629,7 +664,6 @@ class FileFindHandler(IPythonHandler, web.StaticFileHandler):
 
 class APIVersionHandler(APIHandler):
 
-    @json_errors
     def get(self):
         # not authenticated, so give as few info as possible
         self.finish(json.dumps({"version":notebook.__version__}))
