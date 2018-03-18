@@ -11,6 +11,8 @@ import binascii
 import datetime
 import errno
 import gettext
+import hashlib
+import hmac
 import importlib
 import io
 import json
@@ -27,7 +29,6 @@ import threading
 import time
 import warnings
 import webbrowser
-import hmac
 
 try: #PY3
     from base64 import encodebytes
@@ -232,7 +233,7 @@ class NotebookWebApplication(web.Application):
             },
             version_hash=version_hash,
             ignore_minified_js=jupyter_app.ignore_minified_js,
-            
+
             # rate limits
             iopub_msg_rate_limit=jupyter_app.iopub_msg_rate_limit,
             iopub_data_rate_limit=jupyter_app.iopub_data_rate_limit,
@@ -242,7 +243,7 @@ class NotebookWebApplication(web.Application):
             # tornado defaults are 100 MiB, we increase it to 0.5 GiB
             max_body_size = 512 * 1024 * 1024,
             max_buffer_size = 512 * 1024 * 1024,
-            
+
             # authentication
             cookie_secret=jupyter_app.cookie_secret,
             login_url=url_path_join(base_url,'/login'),
@@ -264,6 +265,9 @@ class NotebookWebApplication(web.Application):
 
             # Jupyter stuff
             started=now,
+            # place for extensions to register activity
+            # so that they can prevent idle-shutdown
+            last_activity_times={},
             jinja_template_vars=jupyter_app.jinja_template_vars,
             nbextensions_path=jupyter_app.nbextensions_path,
             websocket_url=jupyter_app.websocket_url,
@@ -360,6 +364,7 @@ class NotebookWebApplication(web.Application):
             sources.append(self.settings['terminal_last_activity'])
         except KeyError:
             pass
+        sources.extend(self.settings['last_activity_times'].values())
         return max(sources)
 
 
@@ -687,37 +692,38 @@ class NotebookApp(JupyterApp):
     @default('cookie_secret_file')
     def _default_cookie_secret_file(self):
         return os.path.join(self.runtime_dir, 'notebook_cookie_secret')
-    
+
     cookie_secret = Bytes(b'', config=True,
         help="""The random bytes used to secure cookies.
         By default this is a new random number every time you start the Notebook.
         Set it to a value in a config file to enable logins to persist across server sessions.
-        
+
         Note: Cookie secrets should be kept private, do not share config files with
         cookie_secret stored in plaintext (you can read the value from a file).
         """
     )
-    
+
     @default('cookie_secret')
     def _default_cookie_secret(self):
         if os.path.exists(self.cookie_secret_file):
             with io.open(self.cookie_secret_file, 'rb') as f:
                 key =  f.read()
         else:
-            key = encodebytes(os.urandom(1024))
+            key = encodebytes(os.urandom(32))
             self._write_cookie_secret_file(key)
-        h = hmac.HMAC(key)
-        h.digest_size = len(key)
+        h = hmac.new(key, digestmod=hashlib.sha256)
         h.update(self.password.encode())
         return h.digest()
 
-
-    
     def _write_cookie_secret_file(self, secret):
         """write my secret to my secret_file"""
         self.log.info(_("Writing notebook server cookie secret to %s"), self.cookie_secret_file)
-        with io.open(self.cookie_secret_file, 'wb') as f:
-            f.write(secret)
+        try:
+            with io.open(self.cookie_secret_file, 'wb') as f:
+                f.write(secret)
+        except OSError as e:
+            self.log.error(_("Failed to write cookie secret to %s: %s"),
+                           self.cookie_secret_file, e)
         try:
             os.chmod(self.cookie_secret_file, 0o600)
         except OSError:
@@ -832,9 +838,11 @@ class NotebookApp(JupyterApp):
         `new` argument passed to the standard library method `webbrowser.open`.
         The behaviour is not guaranteed, but depends on browser support. Valid
         values are:
-            2 opens a new tab,
-            1 opens a new window,
-            0 opens in an existing window.
+
+         - 2 opens a new tab,
+         - 1 opens a new window,
+         - 0 opens in an existing window.
+
         See the `webbrowser.open` documentation for details.
         """))
 
@@ -1267,7 +1275,7 @@ class NotebookApp(JupyterApp):
             self.session_manager, self.kernel_spec_manager,
             self.config_manager, self.extra_services,
             self.log, self.base_url, self.default_url, self.tornado_settings,
-            self.jinja_environment_options
+            self.jinja_environment_options,
         )
         ssl_options = self.ssl_options
         if self.certfile:
@@ -1315,7 +1323,11 @@ class NotebookApp(JupyterApp):
     
     @property
     def display_url(self):
-        ip = self.ip if self.ip else _('[all ip addresses on your system]')
+        hostname = socket.gethostname()
+        if self.ip in ('localhost', '127.0.0.1', hostname):
+            ip = self.ip
+        else:
+            ip = hostname
         url = self._url(ip)
         if self.token:
             # Don't log full token if it came from config
@@ -1548,12 +1560,16 @@ class NotebookApp(JupyterApp):
 
     def write_server_info_file(self):
         """Write the result of server_info() to the JSON file info_file."""
-        with open(self.info_file, 'w') as f:
-            json.dump(self.server_info(), f, indent=2, sort_keys=True)
+        try:
+            with open(self.info_file, 'w') as f:
+                json.dump(self.server_info(), f, indent=2, sort_keys=True)
+        except OSError as e:
+            self.log.error(_("Failed to write server-info to %s: %s"),
+                           self.info_file, e)
 
     def remove_server_info_file(self):
         """Remove the nbserver-<pid>.json file created for this server.
-        
+
         Ignores the error raised when the file has already been removed.
         """
         try:
@@ -1623,7 +1639,7 @@ class NotebookApp(JupyterApp):
                 '\n',
                 'Copy/paste this URL into your browser when you connect for the first time,',
                 'to login with a token:',
-                '    %s' % url_concat(self.connection_url, {'token': self.token}),
+                '    %s' % url_concat(self.display_url, {'token': self.token}),
             ]))
 
         self.io_loop = ioloop.IOLoop.current()
